@@ -1,0 +1,5 @@
+# Host registration for the quick-shell plugin. The client entry is discovered
+# from package.json's dsh.client metadata by the Web client module builder.
+- insert:
+    - id: dsh-quick-shell
+      name: dsh-quick-shell

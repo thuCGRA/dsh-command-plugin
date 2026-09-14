@@ -9,7 +9,7 @@
 | --- | --- | --- |
 | `/shell <command>` | 在 bash 中运行 POSIX 命令 | `bash -c <command>` |
 | `/cmd <command>` | 在 cmd.exe 中运行 Windows 命令 | `cmd.exe /d /s /c <command>`（仅 Windows） |
-| `/pwsh <command>` | 在 PowerShell 中运行命令 | `pwsh -NoProfile -Command <command>`（可执行文件自动解析） |
+| `/pwsh <command>` | 在 PowerShell 中运行命令 | `pwsh -NoProfile -Command <command>`（可执行文件自动解析，固定 UTF-8 输出） |
 
 `/shell` 跨平台运行，需要 `bash` 在 PATH 上（Windows 上通常是 git bash）。`/cmd` 仅在 Windows 可用，其他平台明确报错。`/pwsh` 在 Windows 上自动解析 PowerShell 可执行文件：优先 PowerShell 7（`pwsh`），其次 PATH 上的 `pwsh.exe`（含 Microsoft Store 别名），都没有时回退到 Windows PowerShell 5.1（`powershell.exe`）；其他平台需要 `pwsh` 在 PATH 上。
 
@@ -68,7 +68,7 @@ child_process.spawn 在会话 cwd 下运行
   ↓
 返回 CommandResult，记录 command/done
   ↓
-Web UI 渲染命令结果
+Client 注册的命令卡片渲染标题 `cmd "dir"` + 结果
 ```
 
 ### 子进程与结果回传
@@ -77,13 +77,22 @@ Web UI 渲染命令结果
 
 成功（退出码 0）返回 `kind: 'success'`，非零退出码或超时、取消、spawn 失败返回 `kind: 'error'`，但 `text` 始终包含已收集的输出。
 
+### 命令结果卡片
+
+DSH 默认的命令结果卡片标题只显示命令名（`cmd`）。本插件在 Client 侧向 `conversation.chat.commandview` slot 注册自定义卡片，标题改为「命令名 + 输入原文」——`/cmd "dir"` 显示为 `cmd "dir"`，`/shell ls -la` 显示为 `shell ls -la`。
+
+- 输入原文来自 `command/run` 事件的 `args`（`parseCommand` 的 verbatim `rawInput`，含分隔空格），已随事件记录，无需改动 Host 或会话日志。
+- 卡片复用 ui-chat 的 `chat` locale 字典（`command.running` / `command.done` / `command.failed`）与 `ui-primitives` 的 `DisclosureRow`，因此状态文案与通用卡片一致，且随语言切换更新。
+- 卡片按命令名 keyed 注册（`cmd`、`shell`、`pwsh`），只替换本插件三个命令的渲染；其他命令不受影响。
+
 执行边界：
 
 - 工作目录取 `agent.session.header.cwd`；
 - 30 秒硬超时，到期 `SIGKILL` 杀死子进程并标记 `[timed out]`；
 - 输出上限 1 MiB，超额标记 `[output truncated]`；
 - 监听 `invocation.signal`，UI 取消请求即 `SIGKILL` 并标记 `[aborted by caller]`；
-- 子进程 stdio 为 `['ignore', 'pipe', 'pipe']`，不等待 stdin。
+- 子进程 stdio 为 `['ignore', 'pipe', 'pipe']`，不等待 stdin；
+- `/pwsh` 在每条命令前固定 `[Console]::OutputEncoding` 与 `$OutputEncoding` 为 UTF-8，非 ASCII 输出按 UTF-8 返回，不依赖解码回退。
 
 ## 安装前提
 
@@ -242,11 +251,12 @@ git diff --check
 当前测试覆盖：
 
 - Slash parser 和错误边界；
-- runner 注册表、spawn 配方和 PowerShell 可执行文件解析顺序；
+- runner 注册表、spawn 配方、PowerShell 可执行文件解析顺序和 UTF-8 输出固定；
 - Host 命令注册和 handler 委派；
 - 子进程 stdout/stderr 收集、退出码、超时、取消、截断、ENOENT；
 - 会话 cwd 传递；
 - Web 候选装饰和输入框回填；
+- 命令卡片标题拼接输入原文、running/成功/错误的 summary 与展开行为；
 - Host/Client 入口契约。
 
 `dsh-adapter` 的 spawn 通过 `options.spawn` 注入桩函数测试，不触达真实进程表，测试可在任意平台稳定通过。
@@ -289,6 +299,13 @@ Windows 上出现这个横幅，说明解析链里没有任何可执行的 Power
 - 安装 PowerShell 7：`winget install --id Microsoft.PowerShell`；
 - 注意 Windows PowerShell 5.1 与 PowerShell 7 在语法和输出编码默认值上有差异，回退到 5.1 时命令行为可能不同。
 
+### `/pwsh` 输出乱码
+
+`/pwsh` 在每条命令前固定 UTF-8 输出编码，正常情况下非 ASCII 输出不会乱码。若仍出现乱码，检查：
+
+- 命令首行是否使用 `param(...)`、`#requires` 或 `using`——PowerShell 要求这些语句位于脚本最顶部，编码前置语句会拦住它们；把 `param(...)` 脚本包进 `& { ... }`，或改用脚本文件执行；
+- 命令自身是否重新指定了输出编码（例如再次调用 `chcp`，或重新赋值 `[Console]::OutputEncoding`）。
+
 ### 命令长时间运行无响应
 
 默认 30 秒硬超时到期会 `SIGKILL` 子进程并返回 `[timed out after 30000ms]`。如需更长时间，应在 `createDshAdapter` 的 `options.timeoutMs` 中调整，或把命令改为后台运行并自行重定向输出。
@@ -304,6 +321,15 @@ Windows 上出现这个横幅，说明解析链里没有任何可执行的 Power
 - 是否注册了重复的 input source。
 
 本插件使用 `ctx.commandUi.decorate()`，不重复注册 `/` 输入 source。
+
+### 命令结果卡片不显示输入命令
+
+命令卡片的标题来自 `command/run` 事件的 `name` + `args`。若标题只有命令名：
+
+- 确认 Web 客户端加载的是最新 `client/client.js`（需要重新生成 client bundle 后强制刷新）；
+- 确认 profile 组合了 ui-chat（提供 `conversation.chat.commandview` slot）与 locale 插件；
+- 浏览器控制台是否出现 `[dsh-quick-shell] command decorations and command cards registered`；
+- 命令是否设置了 `recordInput: false`（本插件三个命令都没有）。
 
 ### 依赖或 profile 锁冲突
 
@@ -325,7 +351,7 @@ node_modules
 ```text
 .
 ├── client/
-│   ├── client.js             # Web ModuleLoader 入口
+│   ├── client.js             # Web ModuleLoader 入口（装饰 + 命令卡片）
 │   └── index.js              # 可测试 Client 实现
 ├── src/
 │   ├── index.js              # Host 插件入口

@@ -1,0 +1,17 @@
+node_modules/
+coverage/
+dist/
+build/
+*.log
+.DS_Store
+.dsh/cache/
+.dsh/runtime/
+.dsh/*.log
+.env
+.env.*
+!.env.example
+.playwright/
+test-results/
+
+docs/
+test/*.py
