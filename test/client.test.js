@@ -90,3 +90,34 @@ test('apply registers a command card per runner into the command view slot', () 
   assert.equal(registrations[0].options.locale, 'chat');
   assert.equal(typeof dispose, 'function');
 });
+
+test('decoration offers level prefixes and fills them after the command name', async () => {
+  const decorations = [];
+  const slots = {
+    inject: (key, callback) => callback(),
+    register: () => () => {}
+  };
+  const emissions = [];
+  const actx = {
+    get: (name) => (name === 'conversation'
+      ? { input: { for: () => ({ state: { getSnapshot: () => ({ draft: '/shell', draftRev: 4 }) } }) } }
+      : undefined),
+    emit: (event, payload) => emissions.push({ event, payload })
+  };
+  const context = {
+    commandUi: { decorate(value) { decorations.push(value); return () => {}; } },
+    sessions: { scope: () => actx },
+    get: (name) => (name === 'slots' ? slots : undefined),
+    effect(fn) { return fn(); }
+  };
+  apply(context, { React: fakeReact, primitives: fakePrimitives });
+  const shell = decorations.find((decoration) => decoration.name === 'shell');
+  const options = await shell.ui.options({ sessionId: 's1' });
+  assert.deepEqual(options.map((option) => option.id), ['', ':error', ':warning']);
+  assert.equal(options[1].label, ':error <command>');
+  assert.equal(options[2].detail, 'Print error and warning output lines');
+  await shell.ui.onSelect(options[1], { sessionId: 's1' });
+  assert.equal(emissions.length, 1);
+  assert.equal(emissions[0].event, 'slash/input-insert-text');
+  assert.equal(emissions[0].payload.text, '/shell :error ');
+});

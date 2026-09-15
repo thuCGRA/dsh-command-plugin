@@ -7,6 +7,7 @@
 - [架构总览](#架构总览)
 - [DSH 命令系统集成](#dsh-命令系统集成)
 - [Parser 设计](#parser-设计)
+- [输出级别模型](#输出级别模型)
 - [Runner 注册表](#runner-注册表)
 - [子进程执行模型](#子进程执行模型)
 - [输出解码：UTF-8 优先与 GBK 回退](#输出解码utf-8-优先与-gbk-回退)
@@ -28,14 +29,16 @@
 │       │                                                                 │
 │       ▼                                                                 │
 │  command-runtime.js    遍历 RUNNERS，向 ctx.commands.register 逐个注册  │
-│       │                   handler 职责：解析 → 委派 adapter             │
+│       │                   handler 职责：解析 → 委派 adapter，转发 level │
 │       ▼                                                                 │
 │  dsh-adapter.js        spawnAndCollect：启动子进程、收集输出、超时/取消  │
 │       │                   decodeOutput：UTF-8 优先、GBK 回退            │
+│       │                   filterText：按 level 过滤 stdout/stderr 行    │
 │       ▼                                                                 │
 │  node:child_process    spawn(bash/cmd.exe/pwsh, ...)                   │
 │                                                                         │
-│  parser.js             纯函数，解析 /shell ls -la → { kind, line }     │
+│  parser.js             纯函数，解析输入行 → { kind, line, level }       │
+│  levels.js             零依赖叶子：LEVELS / classifyLine / filterText  │
 │  runners.js            数据注册表，build(command) → { file, args }     │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
@@ -57,32 +60,36 @@
 ### 数据流（一次命令执行）
 
 ```
-用户输入 /shell ls -la 并发送
+用户输入 /shell :error npm run build 并发送
   │
   ▼
-DSH 命令解析器 parseCommand(line)            ← packages/interaction/commands/src/index.ts:122
+DSH 命令解析器 parseCommand(line)            ← packages/interaction/commands/src/index.ts:126
   │  正则 /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/ 匹配 name=shell
-  │  rawInput = " ls -la"
+  │  rawInput = " :error npm run build"
   ▼
-ctx.commands.execute(agent, line, [], signal) ← 同文件 :356
+ctx.commands.execute(agent, line, [], signal) ← 同文件 :361
   │  写 command/run 事件到会话日志
   │  组装 CommandInvocation { commandId, agent, rawInput, signal, attachments }
   ▼
 command-runtime.js handler(invocation)
   │  parseInvocation('shell', invocation)
-  │    → parseSlash('/shell ls -la')
-  │    → { matched: true, command: { kind: 'shell', line: 'ls -la' } }
+  │    → parseSlash('/shell :error npm run build')
+  │    → { matched: true, command: { kind: 'shell', line: 'npm run build', level: 'error' } }
+  │  adapter.runCommand('shell', 'npm run build', invocation, 'error')
   ▼
-adapter.runCommand('shell', 'ls -la', invocation)
-  │  RUNNERS.shell.build('ls -la') → { file: 'bash', args: ['-c', 'ls -la'] }
+dsh-adapter.js runCommand
+  │  RUNNERS.shell.build('npm run build') → { file: 'bash', args: ['-c', 'npm run build'] }
   │  cwd = agent.session.header.cwd
-  │  spawnAndCollect(spawn, recipe, { cwd, signal, timeoutMs, maxBytes, decode })
+  │  spawnAndCollect(spawn, recipe, { cwd, signal, timeoutMs, maxBytes, decode, level })
   ▼
-spawn('bash', ['-c', 'ls -la'], { cwd, stdio: ['ignore','pipe','pipe'] })
+spawn('bash', ['-c', 'npm run build'], { cwd, stdio: ['ignore','pipe','pipe'] })
   │  stdout/stderr → Buffer chunks（受 maxBytes 上限）
   │  exit → finish(code)
   ▼
-{ kind: 'success', text: '[exit code 0]\nfile1\nfile2' }
+finish(): decode 后 filterText(stdout, 'error')、filterText(stderr, 'error')
+  │  只保留错误行；横幅不受过滤
+  ▼
+{ kind: 'error', text: '[exit code 1]\nERROR in ./src/app.js' }
   │
   ▼
 ctx.commands.execute 写 command/done 事件
@@ -97,7 +104,7 @@ Client 命令卡片（标题 name + args）展示 text
 
 ### 命令名解析的硬约束
 
-DSH 的命令解析器（`packages/interaction/commands/src/index.ts:122`）用正则匹配命令名：
+DSH 的命令解析器（`packages/interaction/commands/src/index.ts:126`）用正则匹配命令名：
 
 ```typescript
 const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/u.exec(line)
@@ -117,7 +124,7 @@ const match = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/u.exec(line)
 
 ### CommandInvocation 结构
 
-命令解析成功后，`execute` 组装 `CommandInvocation`（同文件 :40-57）传给 handler：
+命令解析成功后，`execute` 组装 `CommandInvocation`（同文件 :41-58）传给 handler：
 
 ```typescript
 interface CommandInvocation {
@@ -151,13 +158,13 @@ this.appendLifecycle(agent.session, 'command/done', {
 
 ## Parser 设计
 
-`src/parser.js` 是零依赖纯函数，输入字符串，输出结构化结果。
+`src/parser.js` 是纯函数，输入字符串，输出结构化结果，只依赖零依赖叶子 `levels.js`。
 
 ### 返回值类型
 
 ```javascript
 // 匹配成功
-{ matched: true, command: { kind: 'shell', line: 'ls -la', rawInput: '/shell ls -la' } }
+{ matched: true, command: { kind: 'shell', line: 'ls -la', level: 'all', rawInput: '/shell ls -la' } }
 
 // 匹配失败但有明确错误（用户意图是命令但格式不对）
 { matched: false, error: { code: 'MISSING_COMMAND', message: '/shell requires a command' } }
@@ -166,7 +173,7 @@ this.appendLifecycle(agent.session, 'command/done', {
 { matched: false }
 ```
 
-`matched: false` 且无 `error` 表示"这不是命令，放行给模型"。`matched: false` 且有 `error` 表示"这是命令但格式错误，应返回错误"。区分的理由：URL（`https://...`）和行内引用（`请执行 /shell ls`）不应被当成命令错误，应静默放行。
+`command.level` 总是存在：输入没有级别选择符时取 `DEFAULT_LEVEL`（`'all'`）。`matched: false` 且无 `error` 表示"这不是命令，放行给模型"。`matched: false` 且有 `error` 表示"这是命令但格式错误，应返回错误"。区分的理由：URL（`https://...`）和行内引用（`请执行 /shell ls`）不应被当成命令错误，应静默放行。
 
 ### 正则与清理
 
@@ -176,7 +183,8 @@ const match = /^\/([a-z][a-z0-9_-]*)(?:[\t\n\r ]([\s\S]*))?$/.exec(trimmed)
 
 - 命令名必须小写字母开头，后续允许小写、数字、下划线、连字符——与 DSH 的 `COMMAND_NAME = /^[a-z][a-z0-9_-]*$/u` 一致
 - 命令名后捕获空白和剩余文本（`[\s\S]*` 含换行，保留多行命令）
-- 前导冒号容忍：`remainder.replace(/^\s*:?\s*/, '')` 去掉一个可选的 `:`
+- 级别选择符：`/^\s*:([a-z]+)(?=\s|$)/` 匹配剩余文本开头的冒号词，捕获词在 `LEVELS` 中才消费为级别（`/shell :error ls -la` → `level: 'error'`、`line: 'ls -la'`）。lookahead 要求冒号词后是空白或行尾，`/shell :warning: x` 不构成级别，落回前导冒号容忍，运行 `warning: x`
+- 前导冒号容忍：`remainder.replace(/^\s*:?\s*/, '')` 去掉一个可选的 `:`，对非级别冒号词保持生效（`/shell :ls -la` 运行 `ls -la`，`/shell :errorls` 运行 `errorls`）
 
 ### 非命令排除
 
@@ -193,13 +201,48 @@ if (trimmed.startsWith('```') || (trimmed.startsWith('`') && trimmed.endsWith('`
 
 ### RUNNERS 集合同步
 
-`parser.js` 自己维护一份 `RUNNERS = new Set(['shell', 'cmd', 'pwsh'])`，不 import `runners.js`。理由：parser 零依赖更易测。代价是两处需要手动同步——`test/runners.test.js` 有专门测试断言两者一致：
+`parser.js` 自己维护一份 `RUNNERS = new Set(['shell', 'cmd', 'pwsh'])`，不 import `runners.js`。理由：parser 只依赖零依赖叶子 `levels.js`，保持可独立测试。代价是两处需要手动同步——`test/runners.test.js` 有专门测试断言两者一致：
 
 ```javascript
 test('parser RUNNERS set mirrors the registry keys', () => {
   assert.deepEqual([...RUNNER_NAMES].sort(), Object.keys(RUNNERS).sort());
 });
 ```
+
+---
+
+## 输出级别模型
+
+`src/levels.js` 是零依赖叶子模块，定义输出级别的全部语义，被 `parser.js`（提取级别）和 `dsh-adapter.js`（执行过滤）共同引用。导出 `LEVELS`（冻结的 `['error', 'warning', 'all']`）、`DEFAULT_LEVEL`（`'all'`）、`isLevel(value)`、`classifyLine(line)`、`filterText(text, level)`。
+
+### 级别与嵌套
+
+嵌套关系为 `error ⊂ warning ⊂ all`：一个级别保留自己的行类和所有更窄的行类。`error` 只保留错误行；`warning` 保留错误行和警告行；`all` 保留全部行。info 行只在 `all` 存活。
+
+### 行分类关键词
+
+`classifyLine` 对整行原始文本做大小写不敏感的子串匹配，错误关键词先于警告关键词检查，命中即返回该类；两表都不命中为 info：
+
+| 行类 | 关键词 |
+|---|---|
+| error | `error`、`fail`、`fatal`、`panic`、`exception`、`traceback`、`cannot`、`unable to`、`no such file`、`not found`、`refused`、`denied`、`unhandled`、`segmentation fault`、`core dumped`、`killed`、`terminated`、`aborted` |
+| warning | `warn`、`deprecat`、`caution` |
+
+`warn` 和 `deprecat` 是词干，分别覆盖 `warning`/`Warning:` 与 `deprecated`/`deprecation`。`segmentation fault`、`core dumped`、`killed`、`terminated`、`aborted` 覆盖 shell 对信号致死（SIGSEGV、SIGKILL、SIGTERM、SIGABRT）的报告——缺了它们，崩溃命令唯一的一行输出会归为 info，在 `error` 级整行消失。同一行同时命中两表时归 error，由检查顺序决定。分类是对行内容的启发式，不是对输出格式的解析——任何工具的输出都能套用，代价是不含关键词的错误行在 `error` 级不可见。
+
+### 过滤与横幅豁免
+
+`filterText(text, level)` 按级别过滤解码后的正文：
+
+- `all` 直接返回输入字符串，不拆分行。`all` 是默认级别，短路让「与不带选择符的结果逐字节一致」成为构造保证，尾随换行、空行等所有字节原样保留；
+- `warning` 保留 error 与 warning 行，`error` 只保留 error 行；
+- 未知级别抛 `TypeError`，错误消息包含该级别名。
+
+横幅——`[exit code N]`、`[timed out after Nms]`、`[aborted by caller]`、`[output truncated at N bytes]`、`[spawn error: ...]`——在任何级别都完整回传，过滤只作用于解码后的 stdout 与 stderr 正文。`finish()` 先对两个正文分别 `filterText`，再用过滤结果组装横幅与分段：横幅描述进程结局，与输出级别无关；`--- stderr ---` 分段头只在过滤后的 stderr 非空时输出，`error` 级的 stderr 不含错误行时结果里就没有 stderr 分段。
+
+### 默认级别归 parser，adapter 只校验
+
+`level` 字段由 parser 总是填充，未选择时取 `DEFAULT_LEVEL`；adapter 不做默认回退。`runCommand` 收到不在 `LEVELS` 中的级别时直接返回 `Unknown output level: <level>`，不启动子进程。默认值只有一个归属点，到达 adapter 的非法值响亮失败而不是被静默替换。
 
 ---
 
@@ -246,7 +289,7 @@ test('parser RUNNERS set mirrors the registry keys', () => {
 
 ### spawn 选项
 
-`spawnAndCollect` 固定以下 spawn options（`dsh-adapter.js:89-95`）：
+`spawnAndCollect` 固定以下 spawn options（`dsh-adapter.js:92-98`）：
 
 ```javascript
 {
@@ -261,7 +304,7 @@ test('parser RUNNERS set mirrors the registry keys', () => {
 
 ## 子进程执行模型
 
-`spawnAndCollect`（`dsh-adapter.js:79-165`）是插件的核心。它封装了子进程的全部生命周期管理。
+`spawnAndCollect`（`dsh-adapter.js:82-168`）是插件的核心。它封装了子进程的全部生命周期管理。
 
 ### 状态机
 
@@ -279,10 +322,10 @@ spawn 成功
      child 'error'(err) → finish(undefined, err)
          │
          ▼
-      finish(): settled=true; clearTimeout; removeEventListener
-         │  decode stdout/stderr
-         │  组装 banners + sections → text
-         │  ok = code===0 && !spawnError && !aborted && !timedOut
+       finish(): settled=true; clearTimeout; removeEventListener
+          │  decode stdout/stderr → filterText(..., level)
+          │  组装 banners + sections → text（横幅不受过滤）
+          │  ok = code===0 && !spawnError && !aborted && !timedOut
          ▼
       resolve({ kind: ok ? 'success' : 'error', text })
 ```
@@ -381,7 +424,7 @@ const finish = (code, spawnError) => {
 [spawn error: bash not found on PATH]
 ```
 
-横幅在前，输出在后，`stderr` 有独立分段标记。用户始终能看到发生了什么。
+级别不是 `all` 时，stdout/stderr 正文先过滤为该级别保留的行；横幅不受过滤，`--- stderr ---` 分段只在过滤后的 stderr 非空时输出。横幅在前，输出在后，`stderr` 有独立分段标记。用户始终能看到发生了什么。
 
 ### 成功判定
 
@@ -389,7 +432,7 @@ const finish = (code, spawnError) => {
 const ok = code === 0 && !spawnError && !aborted && !timedOut;
 ```
 
-四个条件全满足才是 `success`。非零退出码是 `error` 但仍返回完整输出——用户需要看到错误信息。
+四个条件全满足才是 `success`。非零退出码是 `error` 但仍返回已收集的输出（级别不是 `all` 时为过滤后的行）——用户需要看到错误信息。
 
 ---
 
@@ -403,7 +446,7 @@ bash（git bash）默认输出 UTF-8。pwsh 不同：它的输出编码取决于
 
 ### 解法：两阶段解码
 
-`decodeOutput`（`dsh-adapter.js:21-32`）：
+`decodeOutput`（`dsh-adapter.js:22-33`）：
 
 ```javascript
 function decodeOutput(buf, fallbackEncoding) {
@@ -428,7 +471,7 @@ function decodeOutput(buf, fallbackEncoding) {
 
 ### 自动检测回退编码
 
-`detectFallbackEncoding`（`dsh-adapter.js:40-61`）：
+`detectFallbackEncoding`（`dsh-adapter.js:41-62`）：
 
 ```javascript
 function detectFallbackEncoding() {
@@ -509,20 +552,26 @@ export const PWSH_ENCODING_PREAMBLE =
   ui: {
     kind: 'popupSelect',
     async options() {
-      return [{ id: '', label: '<command>', detail: 'Run a command in bash' }];
+      return [
+        { id: '', label: '<command>', detail: 'Run a command in bash' },
+        { id: ':error', label: ':error <command>', detail: 'Print only output lines that look like errors' },
+        { id: ':warning', label: ':warning <command>', detail: 'Print error and warning output lines' }
+      ];
     },
     onSelect(option, session) { return fillComposer(ctx, 'shell', option, session); }
   }
 }
 ```
 
-### 候选设计：单占位符
+### 候选设计：三个级别选项
 
-与 `dsh-quick-invoke` 不同，shell 命令的参数是自由文本（`ls -la`、`Get-Process | Select-Object -First 3`），无法预生成候选列表。因此 `options()` 返回单个占位符 `{ id: '', label: '<command>' }`：
+与 `dsh-quick-invoke` 不同，shell 命令的参数是自由文本（`ls -la`、`Get-Process | Select-Object -First 3`），无法预生成候选列表。因此 `options()` 返回三个固定前缀选项，按顺序是 `<command>`、`:error <command>`、`:warning <command>`：
 
-- 用户输入 `/shell` → 菜单出现 `/shell` 选项
-- 选择后回填 `/shell `（带尾空格），焦点回到输入框
-- 用户继续输入命令文本，手动发送
+- 选择 `<command>` 回填 `/shell `（默认级别）
+- 选择 `:error <command>` 回填 `/shell :error `
+- 选择 `:warning <command>` 回填 `/shell :warning `
+
+级别前缀写在命令名后的空白之后，因为 DSH 拒绝冒号贴命令名的形式；Host parser 拥有权威的级别语法。选择后回填前缀、焦点回到输入框，用户继续输入命令文本，手动发送。
 
 这保持了"候选选择只回填不执行"的安全边界——与参考插件一致。
 
@@ -541,7 +590,7 @@ const fillComposer = (ctx, runner, option, session) => {
   const tokenStart = state.draft.lastIndexOf(token);
   // 发射插入事件，替换 token 到草稿末尾
   actx.emit('slash/input-insert-text', {
-    text: `${token} ${option.id} `,   // option.id 为空 → "/shell "
+    text: `${token} ${option.id} `,   // id '' → "/shell "；':error' → "/shell :error "
     span: { start: tokenStart, end: state.draft.length, draftRev: state.draftRev }
   });
   focusComposerAfterSelection();
@@ -574,16 +623,17 @@ slots.inject(COMMAND_SLOT, () => slots.register(
 
 ## 测试策略
 
-### 52 个测试，6 个文件
+### 73 个测试，7 个文件
 
 | 文件 | 测试数 | 覆盖 |
 |---|---|---|
-| `parser.test.js` | 9 | 正则匹配、冒号容忍、非命令排除、错误码、RUNNERS 同步 |
+| `parser.test.js` | 11 | 正则匹配、冒号容忍、级别选择符提取与非级别冒号词容忍、非命令排除、错误码、RUNNERS 同步 |
 | `runners.test.js` | 13 | 三个 runner 的 build 配方、平台限制、PowerShell 可执行文件解析、UTF-8 输出固定、RUNNERS 集同步 |
-| `command-runtime.test.js` | 5 | 命令注册、handler 委派、parse 错误短路、冒号容忍、disposer |
-| `dsh-adapter.test.js` | 12 | spawn 收集、退出码、超时、取消、截断、ENOENT、cwd、GBK 解码、UTF-8 不误判 |
+| `command-runtime.test.js` | 6 | 命令注册、handler 委派与级别转发、parse 错误短路、冒号容忍、disposer |
+| `dsh-adapter.test.js` | 18 | spawn 收集、退出码、超时、取消、截断、ENOENT、cwd、GBK 解码、UTF-8 不误判、级别过滤（`all` 原样、`error`/`warning` 行为、横幅保留、stderr 分段省略、未知级别不 spawn） |
+| `levels.test.js` | 11 | `LEVELS`/`DEFAULT_LEVEL`/`isLevel`、全关键词大小写分类、信号致死报告归类、错误先于警告、级别嵌套、`all` 原样返回、未知级别 `TypeError` |
 | `entry.test.js` | 6 | Host/Client 入口契约、cordis.patch.yml、package.json、浏览器 VM 加载 |
-| `client.test.js` | 7 | 命令卡片标题拼接、summary、展开、`slots.inject` 注册、`inject` 列表 |
+| `client.test.js` | 8 | 命令卡片标题拼接、summary、展开、`slots.inject` 注册、`inject` 列表、级别候选顺序与回填文本 |
 
 ### spawn 桩注入
 
@@ -712,34 +762,37 @@ pnpm 创建 junction 后如果路径变了，`pnpm install` 不会自动重建�
 
 | 文件 | 行数 | 职责 | 依赖 |
 |---|---|---|---|
-| `src/index.js` | 18 | Host 插件入口，导出 `name`/`inject`/`apply` | `command-runtime`、`dsh-adapter` |
-| `src/command-runtime.js` | 55 | 遍历 `RUNNERS` 注册命令，handler 解析+委派 | `parser`、`runners` |
-| `src/dsh-adapter.js` | 201 | `spawnAndCollect`（spawn/收集/超时/取消/截断/解码）+ `createDshAdapter` | `node:child_process`、`runners` |
-| `src/parser.js` | 52 | 纯函数 slash parser，零依赖 | 无 |
+| `src/index.js` | 20 | Host 插件入口，导出 `name`/`inject`/`apply` | `command-runtime`、`dsh-adapter` |
+| `src/command-runtime.js` | 55 | 遍历 `RUNNERS` 注册命令，handler 解析+委派并转发 level | `parser`、`runners` |
+| `src/dsh-adapter.js` | 220 | `spawnAndCollect`（spawn/收集/超时/取消/截断/解码/级别过滤）+ `createDshAdapter` | `node:child_process`、`runners`、`levels` |
+| `src/parser.js` | 61 | 纯函数 slash parser，提取命令行与输出级别 | `levels` |
+| `src/levels.js` | 71 | 输出级别模型：`LEVELS`、`classifyLine`、`filterText` | 无 |
 | `src/runners.js` | 157 | runner 数据注册表，`build()` 返回 spawn 配方，PowerShell 可执行文件解析与 UTF-8 输出固定 | `node:fs`、`node:path` |
-| `client/client.js` | 183 | 浏览器 ModuleLoader 工厂入口：`commandUi.decorate` + `slots.inject` 命令卡片 | `react`、`@deepseek-ai/dsh-client-ui-primitives`（模块表基线） |
-| `client/index.js` | 190 | 可测试的 Client 实现，`apply(ctx, deps)` 注入 React/primitives | 无 |
+| `client/client.js` | 190 | 浏览器 ModuleLoader 工厂入口：`commandUi.decorate`（三个级别候选）+ `slots.inject` 命令卡片 | `react`、`@deepseek-ai/dsh-client-ui-primitives`（模块表基线） |
+| `client/index.js` | 194 | 可测试的 Client 实现，`apply(ctx, deps)` 注入 React/primitives | 无 |
 | `cordis.patch.yml` | 5 | Host bundle patch，`insert: id: dsh-quick-shell` | 无 |
 | `package.json` | 37 | 包元数据、peerDeps、`dsh.bundle.patch`、`dsh.client` | 无 |
-| `test/parser.test.js` | 9 tests | parser 正则、错误边界、非命令排除 | `src/parser` |
+| `test/parser.test.js` | 11 tests | parser 正则、级别选择符提取、冒号容忍、非命令排除、错误边界 | `src/parser` |
 | `test/runners.test.js` | 13 tests | spawn 配方、平台限制、PowerShell 可执行文件解析、UTF-8 输出固定、RUNNERS 同步 | `src/runners`、`src/parser` |
-| `test/command-runtime.test.js` | 5 tests | 命令注册、handler 委派、disposer | `src/command-runtime` |
-| `test/dsh-adapter.test.js` | 12 tests | spawn 桩、收集、超时、取消、截断、ENOENT、GBK | `src/dsh-adapter` |
+| `test/command-runtime.test.js` | 6 tests | 命令注册、handler 委派与级别转发、disposer | `src/command-runtime` |
+| `test/dsh-adapter.test.js` | 18 tests | spawn 桩、收集、超时、取消、截断、ENOENT、GBK、级别过滤 | `src/dsh-adapter` |
+| `test/levels.test.js` | 11 tests | 关键词分类（含信号致死报告）、级别嵌套、`all` 原样返回、未知级别 `TypeError` | `src/levels` |
 | `test/entry.test.js` | 6 tests | 入口契约、package.json、浏览器 VM 加载 | `src/index`、`client/index`、`client/client.js` |
-| `test/client.test.js` | 7 tests | 命令卡片标题、summary、展开、slot 注册、`inject` 列表 | `client/index` |
+| `test/client.test.js` | 8 tests | 命令卡片标题、summary、展开、slot 注册、`inject` 列表、级别候选回填 | `client/index` |
 
 ### 分层依赖
 
 ```
 index.js
-  ├── command-runtime.js ──┬── parser.js（零依赖）
+  ├── command-runtime.js ──┬── parser.js ──── levels.js（零依赖叶子）
   │                         └── runners.js（零依赖）
   └── dsh-adapter.js ───────┤
-                             └── runners.js
+                             ├── runners.js
+                             ├── levels.js
                              └── node:child_process
 ```
 
-`parser.js` 是零依赖叶子模块；`runners.js` 只依赖 `node:fs` 和 `node:path`，同样可独立测试。`dsh-adapter.js` 依赖 `node:child_process`，通过 `options.spawn` 注入实现可测试性。
+`levels.js` 是零依赖叶子模块；`parser.js` 只依赖它；`runners.js` 只依赖 `node:fs` 和 `node:path`，同样可独立测试。`dsh-adapter.js` 依赖 `node:child_process` 与 `levels.js`，通过 `options.spawn` 注入实现可测试性。
 
 ---
 
@@ -755,7 +808,7 @@ index.js
 3. 在 `client/client.js` 和 `client/index.js` 的 `RUNNERS` 数组加 `{ id: 'python', detail: '...' }`
 4. 运行 `npm test`——`runners.test.js` 的同步测试会自动验证
 
-不需要改 `command-runtime.js`、`dsh-adapter.js`——它们从 `RUNNERS` 动态生成命令注册。
+不需要改 `command-runtime.js`、`dsh-adapter.js`——它们从 `RUNNERS` 动态生成命令注册。新 runner 自动继承输出级别选择符：级别由 parser 对任意 runner 的输入统一提取，过滤由 adapter 在 `finish()` 统一执行，两者都不感知具体 runner。
 
 ### 调整执行参数
 

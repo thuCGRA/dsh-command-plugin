@@ -5,15 +5,15 @@ import { parseSlash, RUNNERS } from '../src/parser.js';
 test('parses shell, cmd, and pwsh commands with their full command text', () => {
   assert.deepEqual(parseSlash('/shell ls -la'), {
     matched: true,
-    command: { kind: 'shell', line: 'ls -la', rawInput: '/shell ls -la' }
+    command: { kind: 'shell', line: 'ls -la', level: 'all', rawInput: '/shell ls -la' }
   });
   assert.deepEqual(parseSlash('/cmd dir /b'), {
     matched: true,
-    command: { kind: 'cmd', line: 'dir /b', rawInput: '/cmd dir /b' }
+    command: { kind: 'cmd', line: 'dir /b', level: 'all', rawInput: '/cmd dir /b' }
   });
   assert.deepEqual(parseSlash('/pwsh Get-Process | Select-Object -First 3'), {
     matched: true,
-    command: { kind: 'pwsh', line: 'Get-Process | Select-Object -First 3', rawInput: '/pwsh Get-Process | Select-Object -First 3' }
+    command: { kind: 'pwsh', line: 'Get-Process | Select-Object -First 3', level: 'all', rawInput: '/pwsh Get-Process | Select-Object -First 3' }
   });
 });
 
@@ -25,6 +25,36 @@ test('preserves quotes and internal spacing inside the command text', () => {
 test('tolerates a single leading colon after the runner name as a courtesy', () => {
   assert.equal(parseSlash('/shell :ls -la').command.line, 'ls -la');
   assert.equal(parseSlash('/shell : ls -la').command.line, 'ls -la');
+});
+
+test('extracts a recognized level from the leading-colon slot', () => {
+  assert.deepEqual(parseSlash('/shell :error ls -la'), {
+    matched: true,
+    command: { kind: 'shell', line: 'ls -la', level: 'error', rawInput: '/shell :error ls -la' }
+  });
+  assert.deepEqual(parseSlash('/shell :warning  ls'), {
+    matched: true,
+    command: { kind: 'shell', line: 'ls', level: 'warning', rawInput: '/shell :warning  ls' }
+  });
+  assert.equal(parseSlash('/cmd :error dir').command.level, 'error');
+  assert.equal(parseSlash('/pwsh :warning Get-Process').command.level, 'warning');
+});
+
+test('a level selector without a command is MISSING_COMMAND', () => {
+  assert.equal(parseSlash('/shell :error').error.code, 'MISSING_COMMAND');
+  assert.equal(parseSlash('/shell :warning').error.code, 'MISSING_COMMAND');
+});
+
+test('non-level colon words keep the courtesy tolerance and the default level', () => {
+  const colon = parseSlash('/shell :ls -la').command;
+  assert.equal(colon.level, 'all');
+  assert.equal(colon.line, 'ls -la');
+  const glued = parseSlash('/shell :errorls').command;
+  assert.equal(glued.level, 'all');
+  assert.equal(glued.line, 'errorls');
+  const punctuated = parseSlash('/shell :warning: x').command;
+  assert.equal(punctuated.level, 'all');
+  assert.equal(punctuated.line, 'warning: x');
 });
 
 test('rejects the colon-without-space form the way DSH does (not a command)', () => {

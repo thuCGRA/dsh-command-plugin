@@ -169,10 +169,14 @@ export function apply(ctx, deps = {}) {
     ui: {
       kind: 'popupSelect',
       async options() {
-        // No dynamic candidates: a runner takes freeform command text. Offer
-        // a single placeholder so the menu still advertises the command, and
-        // selecting it fills the prefix and returns focus for typing.
-        return [{ id: '', label: '<command>', detail: runner.detail }];
+        // The output-level prefix rides after the separating whitespace
+        // because DSH rejects a colon attached to the command name; the
+        // Host parser owns the authoritative level grammar.
+        return [
+          { id: '', label: '<command>', detail: runner.detail },
+          { id: ':error', label: ':error <command>', detail: 'Print only output lines that look like errors' },
+          { id: ':warning', label: ':warning <command>', detail: 'Print error and warning output lines' }
+        ];
       },
       onSelect: (option, session) => fillComposer(ctx, runner.id, option, session)
     }

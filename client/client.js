@@ -59,7 +59,14 @@ window.__ModuleLoader__.load({
       ui: {
         kind: 'popupSelect',
         async options() {
-          return [{ id: '', label: '<command>', detail: runner.detail }];
+          // The output-level prefix rides after the separating whitespace
+          // because DSH rejects a colon attached to the command name; the
+          // Host parser owns the authoritative level grammar.
+          return [
+            { id: '', label: '<command>', detail: runner.detail },
+            { id: ':error', label: ':error <command>', detail: 'Print only output lines that look like errors' },
+            { id: ':warning', label: ':warning <command>', detail: 'Print error and warning output lines' }
+          ];
         },
         onSelect(option, session) { return fillComposer(ctx, runner.id, option, session); }
       }

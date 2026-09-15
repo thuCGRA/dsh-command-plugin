@@ -1,5 +1,6 @@
 import { spawn as defaultSpawn } from 'node:child_process';
 import { RUNNERS } from './runners.js';
+import { isLevel, filterText } from './levels.js';
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_BYTES = 1_048_576;
@@ -67,16 +68,18 @@ function detectFallbackEncoding() {
  * kills the process; an `AbortSignal` from the dispatching UI request kills
  * it on abort. The resolved text always carries the exit code and any
  * captured output so the user sees what happened regardless of success.
+ * The decoded stdout and stderr bodies are filtered to `opts.level`; the
+ * status banners are never filtered.
  *
  * The spawn function is injected so tests can drive a fake child without
  * touching the real process table.
  *
  * @param {(file: string, args: readonly string[], options: object) => import('node:child_process').ChildProcess} spawnFn - node spawn or a test stub.
  * @param {{ file: string, args: readonly string[], options?: object }} recipe - the spawn recipe from a runner's build().
- * @param {{ cwd?: string, signal?: AbortSignal, timeoutMs: number, maxBytes: number, decode?: (buf: Buffer) => string }} opts - execution bounds.
+ * @param {{ cwd?: string, signal?: AbortSignal, timeoutMs: number, maxBytes: number, decode?: (buf: Buffer) => string, level: string }} opts - execution bounds; `level` is one of LEVELS and filters the decoded bodies only.
  * @returns {Promise<{ kind: 'success' | 'error', text: string }>} the settled command result.
  */
-function spawnAndCollect(spawnFn, recipe, { cwd, signal, timeoutMs, maxBytes, decode }) {
+function spawnAndCollect(spawnFn, recipe, { cwd, signal, timeoutMs, maxBytes, decode, level }) {
   const decodeBuf = typeof decode === 'function' ? decode : (buf) => buf.toString('utf8');
   return new Promise((resolve) => {
     if (signal?.aborted) {
@@ -139,8 +142,8 @@ function spawnAndCollect(spawnFn, recipe, { cwd, signal, timeoutMs, maxBytes, de
       if (timer) clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', onAbort);
 
-      const stdout = decodeBuf(Buffer.concat(stdoutChunks));
-      const stderr = decodeBuf(Buffer.concat(stderrChunks));
+      const stdout = filterText(decodeBuf(Buffer.concat(stdoutChunks)), level);
+      const stderr = filterText(decodeBuf(Buffer.concat(stderrChunks)), level);
       const banners = [];
       if (aborted) banners.push('[aborted by caller]');
       if (timedOut) banners.push(`[timed out after ${timeoutMs}ms]`);
@@ -184,18 +187,34 @@ export function createDshAdapter(_ctx, options = {}) {
         name, description, ...(platforms ? { platforms } : {})
       }));
     },
-    async runCommand(runnerName, line, invocation) {
+    /**
+     * Run one command through its runner.
+     *
+     * `level` selects which output lines reach the result text: the decoded
+     * stdout and stderr bodies are filtered to the level, while the
+     * exit-code, timeout, abort, truncation, and spawn-error banners are
+     * never filtered. The parser owns the default; there is intentionally
+     * no fallback here.
+     *
+     * @param {string} runnerName - runner key in RUNNERS.
+     * @param {string} line - the command line to execute.
+     * @param {object} invocation - DSH command invocation (agent cwd, abort signal).
+     * @param {string} level - one of LEVELS; anything else fails without spawning.
+     * @returns {Promise<{ kind: 'success' | 'error', text: string }>} the settled command result.
+     */
+    async runCommand(runnerName, line, invocation, level) {
       const runner = RUNNERS[runnerName];
       if (!runner) return { kind: 'error', text: `Unknown runner: ${runnerName}` };
       if (runner.platforms && !runner.platforms.includes(process.platform)) {
         return { kind: 'error', text: `Runner ${runnerName} is not available on ${process.platform}` };
       }
       if (!line) return { kind: 'error', text: `/${runnerName} requires a command` };
+      if (!isLevel(level)) return { kind: 'error', text: `Unknown output level: ${level}` };
 
       const agent = invocation?.agent;
       const cwd = agent?.session?.header?.cwd;
       const signal = invocation?.signal;
-      return spawnAndCollect(spawnFn, runner.build(line), { cwd, signal, timeoutMs, maxBytes, decode });
+      return spawnAndCollect(spawnFn, runner.build(line), { cwd, signal, timeoutMs, maxBytes, decode, level });
     }
   };
 }

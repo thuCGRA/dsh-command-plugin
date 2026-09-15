@@ -28,17 +28,17 @@ test('registers exactly the three runner commands', () => {
   ]);
 });
 
-test('shell handler delegates the parsed runner and line to the adapter', async () => {
+test('shell handler delegates the parsed runner, line, and level to the adapter', async () => {
   const ctx = fakeContext();
   const calls = [];
   registerCommands(ctx, {
-    runCommand: async (runner, line, invocation) => {
-      calls.push({ runner, line, hasSignal: !!invocation?.signal });
+    runCommand: async (runner, line, invocation, level) => {
+      calls.push({ runner, line, hasSignal: !!invocation?.signal, level });
       return { kind: 'success', text: `${runner}:${line}` };
     }
   });
   const result = await ctx.definitions[0].handler({ rawInput: ' ls -la', signal: new AbortController().signal });
-  assert.deepEqual(calls, [{ runner: 'shell', line: 'ls -la', hasSignal: true }]);
+  assert.deepEqual(calls, [{ runner: 'shell', line: 'ls -la', hasSignal: true, level: 'all' }]);
   assert.deepEqual(result, { kind: 'success', text: 'shell:ls -la' });
 });
 
@@ -55,9 +55,27 @@ test('handler returns a parse error without calling the adapter', async () => {
 test('handler tolerates a leading colon in the raw input', async () => {
   const ctx = fakeContext();
   const calls = [];
-  registerCommands(ctx, { runCommand: async (runner, line) => { calls.push({ runner, line }); return { kind: 'success', text: '' }; } });
+  registerCommands(ctx, {
+    runCommand: async (runner, line, invocation, level) => {
+      calls.push({ runner, line, level });
+      return { kind: 'success', text: '' };
+    }
+  });
   await ctx.definitions[1].handler({ rawInput: ' :dir', signal: new AbortController().signal });
-  assert.deepEqual(calls, [{ runner: 'cmd', line: 'dir' }]);
+  assert.deepEqual(calls, [{ runner: 'cmd', line: 'dir', level: 'all' }]);
+});
+
+test('handler forwards a parsed output level to the adapter', async () => {
+  const ctx = fakeContext();
+  const calls = [];
+  registerCommands(ctx, {
+    runCommand: async (runner, line, invocation, level) => {
+      calls.push({ runner, line, level });
+      return { kind: 'success', text: '' };
+    }
+  });
+  await ctx.definitions[0].handler({ rawInput: ' :error ls -la', signal: new AbortController().signal });
+  assert.deepEqual(calls, [{ runner: 'shell', line: 'ls -la', level: 'error' }]);
 });
 
 test('disposer unregisters all commands', () => {

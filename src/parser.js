@@ -1,6 +1,8 @@
-// Pure slash parser for the quick-shell runners. Self-contained (no imports)
-// so it stays trivially testable; entry.test.js asserts its runner set stays
-// in sync with src/runners.js.
+// Pure slash parser for the quick-shell runners. Imports only the
+// zero-dependency levels.js leaf so it stays trivially testable;
+// entry.test.js asserts its runner set stays in sync with src/runners.js.
+
+import { LEVELS, DEFAULT_LEVEL } from './levels.js';
 
 /** Runner names accepted by the parser. Must mirror Object.keys(RUNNERS). */
 export const RUNNERS = new Set(['shell', 'cmd', 'pwsh']);
@@ -21,12 +23,12 @@ function ordinary() {
  * handler — it is sent to the model as ordinary text. This parser mirrors
  * that rule: the runner name is [a-z][a-z0-9_-]* followed by a separator.
  *
- * As a courtesy, a single leading ':' after the separator is tolerated
- * (e.g. "/shell :ls" runs "ls"); if a command genuinely starts with ':',
- * use the plain space form.
+ * After the separator, ':<name>' selects an output level when <name> is in
+ * LEVELS (e.g. "/shell :error ls"); any other single leading ':' is
+ * tolerated as a courtesy (e.g. "/shell :ls" runs "ls").
  *
  * @param {string} input - the complete slash command line.
- * @returns {{ matched: true, command: { kind: string, line: string, rawInput: string } } | { matched: false, error?: { code: string, message: string } }}
+ * @returns {{ matched: true, command: { kind: string, line: string, level: string, rawInput: string } } | { matched: false, error?: { code: string, message: string } }}
  */
 export function parseSlash(input) {
   if (typeof input !== 'string') return error('INVALID_INPUT', 'input must be a string');
@@ -45,8 +47,15 @@ export function parseSlash(input) {
   const [, runner, remainder = ''] = match;
   if (!RUNNERS.has(runner)) return error('UNKNOWN_RUNNER', `unknown runner: ${runner}`);
 
-  const line = remainder.replace(/^\s*:?\s*/, '').trim();
+  let rest = remainder;
+  let level = DEFAULT_LEVEL;
+  const levelMatch = /^\s*:([a-z]+)(?=\s|$)/.exec(rest);
+  if (levelMatch && LEVELS.includes(levelMatch[1])) {
+    level = levelMatch[1];
+    rest = rest.slice(levelMatch[0].length);
+  }
+  const line = rest.replace(/^\s*:?\s*/, '').trim();
   if (!line) return error('MISSING_COMMAND', `/${runner} requires a command`);
 
-  return { matched: true, command: { kind: runner, line, rawInput: input } };
+  return { matched: true, command: { kind: runner, line, level, rawInput: input } };
 }

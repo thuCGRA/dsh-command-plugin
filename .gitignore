@@ -13,5 +13,4 @@ build/
 .playwright/
 test-results/
 
-docs/
 test/*.py

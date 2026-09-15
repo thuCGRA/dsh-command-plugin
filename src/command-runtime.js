@@ -40,7 +40,7 @@ export function registerCommands(ctx, adapter = {}) {
     async handler(invocation) {
       const command = parseInvocation(runner.name, invocation);
       if (command.kind === 'error') return command;
-      return adapter.runCommand(command.kind, command.line, invocation);
+      return adapter.runCommand(command.kind, command.line, invocation, command.level);
     }
   }));
 

@@ -73,7 +73,9 @@ test('browser decorations advertise the three runners and fill the composer', as
   assert.deepEqual(slotWaits, ['conversation.chat.commandview', 'conversation.chat.commandview', 'conversation.chat.commandview']);
 
   const options = await decorations[0].ui.options({ sessionId: 's1' });
-  assert.equal(options.length, 1);
+  // Array.from builds the comparison array in this realm: options comes from
+  // the VM realm, whose Array.prototype deepStrictEqual rejects.
+  assert.deepEqual(Array.from(options, (option) => option.id), ['', ':error', ':warning']);
   await decorations[0].ui.onSelect(options[0], { sessionId: 's1' });
   // The request object is created inside the VM realm; compare primitives to
   // avoid cross-realm prototype rejection under deepStrictEqual.
@@ -84,4 +86,9 @@ test('browser decorations advertise the three runners and fill the composer', as
   assert.equal(emitted[0][1].span.start, 0);
   assert.equal(emitted[0][1].span.end, 6);
   assert.equal(emitted[0][1].span.draftRev, 1);
+
+  // The level prefix rides after the separating whitespace: DSH requires
+  // whitespace after the command name, so /shell:error is never a command.
+  await decorations[0].ui.onSelect(options[1], { sessionId: 's1' });
+  assert.equal(emitted[1][1].text, '/shell :error ');
 });

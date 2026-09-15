@@ -11,6 +11,14 @@
 | `/cmd <command>` | 在 cmd.exe 中运行 Windows 命令 | `cmd.exe /d /s /c <command>`（仅 Windows） |
 | `/pwsh <command>` | 在 PowerShell 中运行命令 | `pwsh -NoProfile -Command <command>`（可执行文件自动解析，固定 UTF-8 输出） |
 
+三个 runner 都接受可选的输出级别选择符，决定哪些输出行回传到 Web 前端：
+
+| 形式 | 回传的输出行 |
+| --- | --- |
+| `/shell <command>` | 全部输出（`all`，默认） |
+| `/shell :warning <command>` | 错误行 + 警告行 |
+| `/shell :error <command>` | 仅错误行 |
+
 `/shell` 跨平台运行，需要 `bash` 在 PATH 上（Windows 上通常是 git bash）。`/cmd` 仅在 Windows 可用，其他平台明确报错。`/pwsh` 在 Windows 上自动解析 PowerShell 可执行文件：优先 PowerShell 7（`pwsh`），其次 PATH 上的 `pwsh.exe`（含 Microsoft Store 别名），都没有时回退到 Windows PowerShell 5.1（`powershell.exe`）；其他平台需要 `pwsh` 在 PATH 上。
 
 命令文本保留引号和内部空白。例如：
@@ -31,7 +39,28 @@ DSH 的命令解析器要求命令名后必须有空白，所以 `/shell:ls`（�
 /pwsh Get-Process
 ```
 
-作为善意兼容，parser 容忍命令名后单个前导冒号，`/shell :ls -la` 与 `/shell ls -la` 等价。若命令本身以 `:` 开头，请使用纯空格形式。
+三个 runner 都接受一个可选的输出级别选择符，写在命令名后的空白之后、命令文本之前：
+
+```text
+/shell <command>            # all：全部输出，默认
+/shell :warning <command>   # 错误行 + 警告行
+/shell :error <command>     # 仅错误行
+```
+
+级别嵌套为 `error ⊂ warning ⊂ all`：`error` 保留的行最少，`all` 保留全部。冒号必须跟在分隔空白之后——`/shell:error <command>`（冒号贴命令名）不会被识别为命令，DSH 不分发它，整行作为普通文本发给模型，与 `/shell:ls` 是同一条命令名约束。
+
+输出行按内容分类：对整行原始文本做大小写不敏感的子串匹配，错误关键词先于警告关键词检查。两张表都不命中的行是 info，只在 `all` 级保留。
+
+| 行类 | 关键词 |
+| --- | --- |
+| error | `error`、`fail`、`fatal`、`panic`、`exception`、`traceback`、`cannot`、`unable to`、`no such file`、`not found`、`refused`、`denied`、`unhandled`、`segmentation fault`、`core dumped`、`killed`、`terminated`、`aborted` |
+| warning | `warn`、`deprecat`、`caution` |
+
+`warning` 级保留错误行和警告行，`error` 级只保留错误行。分类是内容启发式，不是语法解析：不含任何关键词的错误行在 `error` 级不可见。
+
+作为善意兼容，parser 容忍命令名后单个前导冒号。该容忍对不是级别关键词的词保持生效：`/shell :ls -la` 运行 `ls -la`，`/shell :errorls` 运行 `errorls`，`/shell :warning: x` 运行 `warning: x`，三者都是默认级别 `all`。若命令本身以 `:` 开头，请使用纯空格形式。
+
+只写级别不写命令（如 `/shell :error`）返回错误 `/shell requires a command`。
 
 ## 工作原理
 
@@ -66,6 +95,8 @@ child_process.spawn 在会话 cwd 下运行
   ↓
 收集 stdout/stderr，应用超时与输出上限
   ↓
+按输出级别过滤 stdout/stderr 行，横幅不受过滤
+  ↓
 返回 CommandResult，记录 command/done
   ↓
 Client 注册的命令卡片渲染标题 `cmd "dir"` + 结果
@@ -73,9 +104,9 @@ Client 注册的命令卡片渲染标题 `cmd "dir"` + 结果
 
 ### 子进程与结果回传
 
-`command/done` 事件携带 `{ kind, text }`，`text` 包含退出码横幅、stdout、stderr 分段以及超时/取消/截断标记。Web UI 的命令结果渲染器负责展示，无需额外客户端抓取逻辑。
+`command/done` 事件携带 `{ kind, text }`，`text` 包含退出码横幅、stdout、stderr 分段以及超时/取消/截断标记。输出级别不是 `all` 时，stdout/stderr 正文先过滤为该级别保留的行；横幅不受过滤，`--- stderr ---` 分段只在过滤后的 stderr 非空时输出。Web UI 的命令结果渲染器负责展示，无需额外客户端抓取逻辑。
 
-成功（退出码 0）返回 `kind: 'success'`，非零退出码或超时、取消、spawn 失败返回 `kind: 'error'`，但 `text` 始终包含已收集的输出。
+成功（退出码 0）返回 `kind: 'success'`，非零退出码或超时、取消、spawn 失败返回 `kind: 'error'`，但 `text` 始终包含已收集的输出（级别不是 `all` 时为过滤后保留的行）。
 
 ### 命令结果卡片
 
@@ -92,7 +123,11 @@ DSH 默认的命令结果卡片标题只显示命令名（`cmd`）。本插件�
 - 输出上限 1 MiB，超额标记 `[output truncated]`；
 - 监听 `invocation.signal`，UI 取消请求即 `SIGKILL` 并标记 `[aborted by caller]`；
 - 子进程 stdio 为 `['ignore', 'pipe', 'pipe']`，不等待 stdin；
-- `/pwsh` 在每条命令前固定 `[Console]::OutputEncoding` 与 `$OutputEncoding` 为 UTF-8，非 ASCII 输出按 UTF-8 返回，不依赖解码回退。
+- `/pwsh` 在每条命令前固定 `[Console]::OutputEncoding` 与 `$OutputEncoding` 为 UTF-8，非 ASCII 输出按 UTF-8 返回，不依赖解码回退；
+- 输出级别只过滤解码后的 stdout/stderr 正文；`[exit code N]`、`[timed out after Nms]`、`[aborted by caller]`、`[output truncated at N bytes]`、`[spawn error: ...]` 横幅在任何级别都完整回传；
+- `all` 级原样返回解码文本，不做拆分重组，与不带选择符的结果逐字节一致；
+- 过滤后的 stderr 为空时省略 `--- stderr ---` 分段，`error` 级的 stderr 不含错误行时结果里没有 stderr 分段；
+- 未知级别到达 Host adapter 时返回 `Unknown output level: <level>`，不启动子进程。
 
 ## 安装前提
 
@@ -221,8 +256,8 @@ dsh web --no-open
 ### 命令执行
 
 1. 输入 `/shell`；
-2. 选择候选，输入框回填 `/shell `；
-3. 继续输入命令，例如 `/shell ls -la`；
+2. `/` 菜单为每个 runner 提供三个候选，按顺序是 `<command>`、`:error <command>`、`:warning <command>`，选择后分别回填 `/shell `、`/shell :error `、`/shell :warning `；
+3. 继续输入命令，例如 `/shell ls -la` 或 `/shell :error npm run build`；
 4. 手动发送。
 
 选择候选只会回填前缀并交还输入焦点，不会自动发送，也不会在选择瞬间启动子进程。
@@ -250,12 +285,13 @@ git diff --check
 
 当前测试覆盖：
 
-- Slash parser 和错误边界；
+- Slash parser 和错误边界，含级别选择符提取与非级别冒号词容忍；
+- 输出级别模型：关键词分类、错误先于警告、级别嵌套、`all` 原样返回、未知级别报错；
 - runner 注册表、spawn 配方、PowerShell 可执行文件解析顺序和 UTF-8 输出固定；
-- Host 命令注册和 handler 委派；
-- 子进程 stdout/stderr 收集、退出码、超时、取消、截断、ENOENT；
+- Host 命令注册和 handler 委派，含级别转发；
+- 子进程 stdout/stderr 收集、退出码、超时、取消、截断、ENOENT，含级别过滤：横幅不过滤、stderr 分段省略、未知级别不 spawn；
 - 会话 cwd 传递；
-- Web 候选装饰和输入框回填；
+- Web 候选装饰和输入框回填，含三个级别候选的顺序与回填文本；
 - 命令卡片标题拼接输入原文、running/成功/错误的 summary 与展开行为；
 - Host/Client 入口契约。
 
@@ -279,6 +315,10 @@ git diff --check
 `/shell:ls`（无空格）不会被 DSH 识别为命令。改为 `/shell ls` 或 `/shell :ls`。
 
 如果没有 `command/run`，通常说明当前 Web 进程没有加载插件或客户端仍使用旧命令目录。停止旧 Web 实例，重新执行安装和启动，再 `Ctrl+Shift+R` 刷新浏览器。
+
+### 输出行比预期少或为空
+
+命令带了 `:warning` 或 `:error` 级别选择符时，stdout/stderr 正文中不匹配级别关键词的行被过滤，横幅（如 `[exit code N]`）仍会回传。用不带选择符的 `/shell <command>`（或任意 runner 的默认形式）可看到全部输出。另外，`/shell:error <command>`（冒号贴命令名、无空格）不是命令，整行会作为普通文本发给模型；选择符必须写在命令名后的空白之后。
 
 ### `/shell` 报 bash not found
 
@@ -357,6 +397,7 @@ node_modules
 │   ├── index.js              # Host 插件入口
 │   ├── command-runtime.js    # 命令注册和 handler 委派
 │   ├── dsh-adapter.js        # 子进程 spawn 与输出收集
+│   ├── levels.js             # 输出级别模型（LEVELS、行分类、过滤，零依赖叶子）
 │   ├── parser.js             # 纯函数 Slash parser
 │   └── runners.js            # runner 注册表（shell/cmd/pwsh）
 ├── test/                     # Node 合同测试
@@ -369,7 +410,7 @@ node_modules
 
 - UI 候选不是授权边界，Host 必须重新解析和校验；
 - 子进程在会话 cwd 下运行，继承 harness 进程环境；
-- 非零退出码返回 `kind: 'error'`，但完整返回已收集的输出；
+- 非零退出码返回 `kind: 'error'`，但返回已收集的输出（级别不是 `all` 时为过滤后的行）；
 - 超时、取消、截断、spawn 失败都明确标记，不静默吞掉；
 - `bash`、`cmd.exe`、PowerShell 不可用时返回明确错误，不静默跳过；
 - 命令结果不自动变成模型历史消息，需要继续 Agent 工作时应显式提交受支持的 Agent 输入；
